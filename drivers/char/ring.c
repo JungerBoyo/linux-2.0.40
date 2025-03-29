@@ -119,6 +119,7 @@ int ring_write(struct inode *inode,struct file *file,const char *pB,int count)
 }
 
 #define IOCTL_BUFF_SIZE_WRITE 0x00
+#define IOCTL_BUFF_SIZE_READ 0x01
 
 int ring_ioctl(struct inode *inode,struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -142,6 +143,10 @@ int ring_ioctl(struct inode *inode,struct file *file, unsigned int cmd, unsigned
 			up(&dev->sem);
 			return 0;
 		};
+		case IOCTL_BUFF_SIZE_READ: {
+			put_user(dev->buffersize, (int *)(arg));
+			return 0;
+		}
 	}
 
 	return -EINVAL;
