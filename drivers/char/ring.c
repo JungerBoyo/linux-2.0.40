@@ -140,6 +140,7 @@ int ring_ioctl(struct inode *inode,struct file *file, unsigned int cmd, unsigned
 			}
 			dev->buffersize = arg;
 			up(&dev->sem);
+			return 0;
 		};
 	}
 
