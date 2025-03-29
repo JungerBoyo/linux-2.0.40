@@ -388,6 +388,8 @@ static struct file_operations memory_fops = {
 	NULL		/* fsync */
 };
 
+extern void ring_init(void);
+
 int chr_dev_init(void)
 {
 	if (register_chrdev(MEM_MAJOR,"mem",&memory_fops))
@@ -397,6 +399,7 @@ int chr_dev_init(void)
 #ifdef CONFIG_PRINTER
 	lp_init();
 #endif
+	ring_init();
 #if defined (CONFIG_BUSMOUSE) || defined(CONFIG_UMISC) || \
     defined (CONFIG_PSMOUSE) || defined (CONFIG_MS_BUSMOUSE) || \
     defined (CONFIG_ATIXL_BUSMOUSE) || defined(CONFIG_SOFT_WATCHDOG) || \
