@@ -10,6 +10,7 @@ if [ "$CONFIG_SERIAL" != "n" ]; then
       bool '  PCI serial support (EXPERIMENTAL)' CONFIG_SERIAL_PCI
    fi
 fi
+tristate 'Kwedloring' CONFIG_RING
 bool 'Digiboard PC/Xx Support' CONFIG_DIGI
 tristate 'Cyclades async mux support' CONFIG_CYCLADES
 if [ "$CONFIG_EXPERIMENTAL" = "y" -a "$CONFIG_CYCLADES" != "n" ]; then

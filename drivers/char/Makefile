@@ -22,7 +22,7 @@ L_TARGET := char.a
 M_OBJS   :=
 L_OBJS   := tty_io.o n_tty.o console.o \
 	tty_ioctl.o pty.o vt.o mem.o vc_screen.o random.o \
-	consolemap.o selection.o ring.o
+	consolemap.o selection.o
 
 ifeq ($(CONFIG_SERIAL),y)
   ifndef CONFIG_SUN_SERIAL
@@ -31,6 +31,14 @@ ifeq ($(CONFIG_SERIAL),y)
 else
   ifeq ($(CONFIG_SERIAL),m)
   MX_OBJS += serial.o
+  endif
+endif
+
+ifeq ($(CONFIG_RING),y)
+L_OBJS += ring.o
+else
+  ifeq ($(CONFIG_RING),m)
+  M_OBJS += ring.o
   endif
 endif
 

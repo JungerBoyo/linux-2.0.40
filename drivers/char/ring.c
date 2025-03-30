@@ -1,3 +1,4 @@
+#include <linux/module.h>
 
 #include <linux/kernel.h>
 #include <linux/sched.h>
@@ -170,7 +171,7 @@ static void ring_devs_init()
 	}
 }
 
-void ring_init(void)
+static void ring_init(void)
 {
 	init_waitqueue(&write_queue);
 	init_waitqueue(&read_queue);
@@ -178,3 +179,20 @@ void ring_init(void)
 	register_chrdev(RING_MAJOR,"ring",&ring_ops);
 	printk("Ring device initialized\n");
 }
+
+#ifdef MODULE
+int init_module(void)
+{
+	ring_init();
+	return 0;
+}
+
+void cleanup_module(void)
+{
+	int i;
+	for (i = 0; i < DEVS_COUNT; ++i)
+		if (ring_devs[i].usecount > 0)
+			kfree(ring_devs[i].buffer);	
+	unregister_chrdev(RING_MAJOR, "ring");
+}
+#endif
