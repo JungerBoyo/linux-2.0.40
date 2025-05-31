@@ -747,6 +747,9 @@ int blk_dev_init(void)
 #ifdef CONFIG_BLK_DEV_RAM
 	rd_init();
 #endif /* CONFIG_BLK_DEV_RAM */
+#ifdef CONFIG_BLK_DEV_ZRAM
+	zrd_init();
+#endif /* CONFIG_BLK_DEV_ZRAM */
 #ifdef CONFIG_BLK_DEV_LOOP
 	loop_init();
 #endif /* CONFIG_BLK_DEV_LOOP */

@@ -37,6 +37,14 @@ else
   endif
 endif
 
+ifeq ($(CONFIG_BLK_DEV_ZRAM),y)
+L_OBJS += zram_disk.o
+else
+  ifeq ($(CONFIG_BLK_DEV_ZRAM),m)
+  M_OBJS += zram_disk.o
+  endif
+endif
+
 ifeq ($(CONFIG_BLK_DEV_LOOP),y)
 L_OBJS += loop.o
 else
