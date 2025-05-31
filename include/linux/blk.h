@@ -137,6 +137,16 @@ void initrd_init(void);
 #define DEVICE_OFF(device)
 #define DEVICE_NO_RANDOM
 
+#elif (MAJOR_NR == ZRAMDISK_MAJOR)
+
+/* zram disk */
+#define DEVICE_NAME "zramdisk"
+#define DEVICE_REQUEST zrd_request
+#define DEVICE_NR(device) (MINOR(device))
+#define DEVICE_ON(device)
+#define DEVICE_OFF(device)
+#define DEVICE_NO_RANDOM
+
 #elif (MAJOR_NR == FLOPPY_MAJOR)
 
 static void floppy_off(unsigned int nr);

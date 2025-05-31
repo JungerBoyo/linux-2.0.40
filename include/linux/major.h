@@ -71,6 +71,7 @@
 
 #define IDE4_MAJOR	56
 #define IDE5_MAJOR	57
+#define ZRAMDISK_MAJOR 58
 
 #define APBLOCK_MAJOR   60   /* AP1000 Block device */
 #define DDV_MAJOR       61   /* AP1000 DDV block device */
