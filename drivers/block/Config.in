@@ -58,6 +58,8 @@ tristate 'RAM disk support' CONFIG_BLK_DEV_RAM
 if [ "$CONFIG_BLK_DEV_RAM" = "y" ]; then
    bool '  Initial RAM disk (initrd) support' CONFIG_BLK_DEV_INITRD
 fi
+tristate 'ZRAM disk support' CONFIG_BLK_DEV_ZRAM
+
 tristate 'XT harddisk support' CONFIG_BLK_DEV_XD
 if [ "$CONFIG_PCI" = "y" ]; then
    bool 'Mylex DAC960 PCI RAID Controller support' CONFIG_BLK_DEV_DAC960
