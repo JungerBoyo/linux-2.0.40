@@ -14,22 +14,29 @@
  * Module params
  */
 int zrd_num_devices = 1;
-int zrd_blk_size    = 128;
+int zrd_blk_size    = 1024;
+int zrd_verbose_log = 0;
 
 /*
  * Module defs and types
  */
 #define ZRD_BLKSIZE_SIZE PAGE_SIZE
-#define ZRD_HARDESC_SIZE ZRD_BLKSIZE_SIZE
+#define ZRD_HARDSECT_SIZE 512
 
-#define ZRD_IO_COMPRESSION_RATE_GET _IOR(ZRAMDISK_MAJOR, 0, int)
+#define ZRD_SECTORS_IN_BLK (ZRD_BLKSIZE_SIZE / ZRD_HARDSECT_SIZE)
+#define ZRD_INITIAL_BLKSIZE_SIZE 4096
+
+#define ZRD_IO_COMPRESSION_RATE_GET _IOR(MAJOR_NR, 0, long)
 
 struct zrd_dev {
     int nr;
-    void *ptr;
-    unsigned short *pages;
+    void **blocks;
+    unsigned short *block_sizes;
     int size;
+    void *scratch_blk;
 };
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 /*
  * Module data
@@ -38,12 +45,13 @@ static void *zrd_mem;
 static struct zrd_dev *zrd_devs;
 static int *zrd_blk_sizes;
 static int *zrd_blksize_sizes;
-static int *zrd_hardesct_sizes;
+static int *zrd_hardsect_sizes;
 
 /*
  * Module interface
  */
-static int zrd_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg);
+static int zrd_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
+                     unsigned long arg);
 static int zrd_open(struct inode *inode, struct file *file);
 static void zrd_release(struct inode *inode, struct file *file);
 
@@ -61,7 +69,7 @@ static struct file_operations file_ops = {
 #else
     .release = zrd_release,
 #endif
-    .fsync = NULL,
+    .fsync = block_fsync,
 };
 
 static void zrd_request(void);
@@ -75,42 +83,46 @@ int zrd_init(void)
     int mem_size;
 
     if (zrd_num_devices < 1 || zrd_blk_size < 1) {
-        printk("ZRAMDISK: num of devices and blk size must be at least 1");
+        printk("ZRAMDISK: num of devices and blk size must be at least 1\n");
         return -EINVAL;
     }
 
-    mem_size = zrd_num_devices * (sizeof(struct zrd_dev) + sizeof(int) + sizeof(int) + sizeof(int));
+    mem_size = zrd_num_devices * (sizeof(struct zrd_dev) + sizeof(int) +
+                                  sizeof(int) + sizeof(int));
     zrd_mem  = kmalloc(mem_size, GFP_KERNEL);
     if (zrd_mem == NULL) {
-        printk("ZRAMDISK: Failed to allocate zramdisk driver metadata");
+        printk("ZRAMDISK: Failed to allocate zramdisk driver metadata\n");
         return -ENOMEM;
     }
 
-    if (register_blkdev(ZRAMDISK_MAJOR, "zramdisk", &file_ops)) {
-        printk("ZRAMDISK: Could not get major %d", MAJOR_NR);
+    if (register_blkdev(MAJOR_NR, "zramdisk", &file_ops)) {
+        printk("ZRAMDISK: Could not get major %d\n", MAJOR_NR);
         goto err_register;
     }
 
     zrd_devs           = zrd_mem;
     zrd_blk_sizes      = (int *)(zrd_devs + zrd_num_devices);
     zrd_blksize_sizes  = zrd_blk_sizes + zrd_num_devices;
-    zrd_hardesct_sizes = zrd_blksize_sizes + zrd_num_devices;
+    zrd_hardsect_sizes = zrd_blksize_sizes + zrd_num_devices;
 
     for (i = 0; i < zrd_num_devices; ++i) {
-        zrd_devs[i].nr        = i;
-        zrd_devs[i].ptr       = NULL;
-        zrd_devs[i].pages     = NULL;
-        zrd_devs[i].size      = 0;
-        zrd_blk_sizes[i]      = zrd_blk_size;
-        zrd_blksize_sizes[i]  = ZRD_BLKSIZE_SIZE;
-        zrd_hardesct_sizes[i] = ZRD_HARDESC_SIZE;
+        zrd_devs[i].nr          = i;
+        zrd_devs[i].blocks      = NULL;
+        zrd_devs[i].block_sizes = NULL;
+        zrd_devs[i].size        = zrd_blk_size * ZRD_BLKSIZE_SIZE;
+        zrd_blk_sizes[i]        = zrd_blk_size;
+        zrd_blksize_sizes[i]    = ZRD_BLKSIZE_SIZE;
+        zrd_hardsect_sizes[i]   = ZRD_HARDSECT_SIZE;
     }
 
-    blk_dev[ZRAMDISK_MAJOR].request_fn = &zrd_request;
-    blk_size[ZRAMDISK_MAJOR]           = zrd_blk_sizes;
-    blksize_size[ZRAMDISK_MAJOR]       = zrd_blksize_sizes;
-    hardsect_size[ZRAMDISK_MAJOR]      = zrd_hardesct_sizes;
+    blk_dev[MAJOR_NR].request_fn = &zrd_request;
+    blk_size[MAJOR_NR]           = zrd_blk_sizes;
+    blksize_size[MAJOR_NR]       = zrd_blksize_sizes;
+    hardsect_size[MAJOR_NR]      = zrd_hardsect_sizes;
 
+    printk("ZRAMDISK: initialized zrd_num_devices=%d, zrd_blk_size=%d, "
+           "zrd_verbose_log=%d\n",
+           zrd_num_devices, zrd_blk_size, zrd_verbose_log);
     return 0;
 err_register:
     kfree(zrd_mem);
@@ -125,16 +137,28 @@ int init_module(void)
 
 void cleanup_module(void)
 {
-    int i;
+    int i, j;
 
-    for (i = 0; i < zrd_num_devices; ++i)
-        if (zrd_devs[i].ptr != NULL)
-            kfree(zrd_devs[i].ptr);
+    for (i = 0; i < zrd_num_devices; ++i) {
+        if (zrd_devs[i].block_sizes != NULL)
+            kfree(zrd_devs[i].block_sizes);
+
+        if (zrd_devs[i].blocks != NULL) {
+            for (j = 0; j < zrd_blk_size; ++j)
+                kfree(zrd_devs[i].blocks[j]);
+            kfree(zrd_devs[i].blocks);
+        }
+
+        if (zrd_devs[i].scratch_blk != NULL)
+            kfree(zrd_devs[i].scratch_blk);
+    }
 
     kfree(zrd_mem);
 
-    unregister_blkdev(ZRAMDISK_MAJOR, "zramdisk");
-    blk_dev[ZRAMDISK_MAJOR].request_fn = NULL;
+    unregister_blkdev(MAJOR_NR, "zramdisk");
+    blk_dev[MAJOR_NR].request_fn = NULL;
+
+    printk("ZRAMDISK: cleaned up\n");
 }
 #endif
 
@@ -153,12 +177,16 @@ static struct zrd_dev *get_dev(struct inode *inode)
 /*
  * Module impl.
  */
-static int zrd_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg)
+static int zrd_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
+                     unsigned long arg)
 {
-    int i, err, valid_pages, total_size;
+    int i, err, valid_block_sizes, total_size;
     struct zrd_dev *dev = get_dev(inode);
     if (dev == NULL)
         return -ENXIO;
+
+    if (zrd_verbose_log)
+        printk("ZRAMDISK: ioctl cmd %d on dev %d\n", cmd, dev->nr);
 
     switch (cmd) {
     case ZRD_IO_COMPRESSION_RATE_GET: {
@@ -169,15 +197,22 @@ static int zrd_ioctl(struct inode *inode, struct file *file, unsigned int cmd, u
         if (err)
             return err;
 
-		valid_pages = 0;
-		total_size = 0;
-		for (i = 0; i < zrd_blk_size; ++i)
-			if (dev->pages[i] != 0) {
-				++valid_pages;
-				total_size += (int)(dev->pages[i]);
-			}
+        valid_block_sizes = 0;
+        total_size        = 0;
+        for (i = 0; i < zrd_blk_size; ++i)
+            if (dev->block_sizes[i] != 0) {
+                ++valid_block_sizes;
+                total_size += (int)(dev->block_sizes[i]);
+            }
 
-        put_user(1000 * total_size / (valid_pages * PAGE_SIZE), (long *)arg);
+        put_user(1000 * total_size / (valid_block_sizes * ZRD_BLKSIZE_SIZE),
+                 (long *)arg);
+        break;
+    }
+    case BLKFLSBUF: {
+        if (!suser())
+            return -EACCES;
+        invalidate_buffers(inode->i_rdev);
         break;
     }
     case BLKGETSIZE: {
@@ -188,60 +223,94 @@ static int zrd_ioctl(struct inode *inode, struct file *file, unsigned int cmd, u
         if (err)
             return err;
 
-        put_user(dev->size / ZRD_HARDESC_SIZE, (long *)arg);
-        return 0;
+        put_user((zrd_blk_size * ZRD_BLKSIZE_SIZE) / ZRD_HARDSECT_SIZE,
+                 (long *)arg);
+        break;
     }
+    default:
+        return -EINVAL;
     }
     return 0;
 }
 static int zrd_open(struct inode *inode, struct file *file)
 {
+    int i, j;
     struct zrd_dev *dev = get_dev(inode);
     if (dev == NULL)
         return -ENXIO;
 
-    if (dev->ptr == NULL) {
-        dev->pages = kmalloc(zrd_blk_size * sizeof(*dev->pages), GFP_KERNEL);
-        if (dev->pages == NULL) {
-            printk("ZRAMDISK: Failed to allocate zramdisk %d metadata of size %d", dev->nr,
-                   zrd_blk_size * sizeof(*dev->pages));
-            return -ENOMEM;
+    if (dev->block_sizes == NULL) {
+        dev->block_sizes =
+            kmalloc(zrd_blk_size * sizeof(*dev->blocks), GFP_KERNEL);
+        if (dev->block_sizes == NULL) {
+            printk("ZRAMDISK: Failed to allocate zramdisk %d block_sizes\n",
+                   dev->nr);
+            goto err_block_sizes;
         }
-        memset((void *)dev->pages, 0, zrd_blk_size * sizeof(*dev->pages));
 
-        dev->size = zrd_blk_size * ZRD_BLKSIZE_SIZE;
-        dev->ptr  = vmalloc(dev->size);
-        if (dev->ptr == NULL) {
-            printk("ZRAMDISK: Failed to allocate zramdisk %d of size %d", dev->nr, dev->size);
-            return -ENOMEM;
+        dev->blocks = kmalloc(zrd_blk_size * sizeof(*dev->blocks), GFP_KERNEL);
+        if (dev->blocks == NULL) {
+            printk("ZRAMDISK: Failed to allocate zramdisk %d blocks\n",
+                   dev->nr);
+            goto err_blocks;
+        }
+
+        for (i = 0; i < zrd_blk_size; ++i) {
+            dev->block_sizes[i] = ZRD_INITIAL_BLKSIZE_SIZE;
+            dev->blocks[i]      = kmalloc(ZRD_INITIAL_BLKSIZE_SIZE, GFP_KERNEL);
+            if (dev->blocks[i] == NULL) {
+                printk("ZRAMDISK: Failed to allocate zramdisk %d block %d\n",
+                       dev->nr, i);
+                goto err_block;
+            }
+        }
+
+        dev->scratch_blk = kmalloc(ZRD_BLKSIZE_SIZE, GFP_KERNEL);
+        if (dev->scratch_blk == NULL) {
+            printk("ZRAMDISK: Failed to allocate scratch blk for dev %d\n",
+                   dev->nr);
+            goto err_scratch;
         }
     }
 
     MOD_INC_USE_COUNT;
 
-    printk("ZRAMDISK: Opened dev %d", dev->nr);
+    printk("ZRAMDISK: Opened dev %d\n", dev->nr);
     return 0;
+
+err_scratch:
+err_block:
+    for (j = 0; j < i; ++j)
+        kfree(dev->blocks[j]);
+    kfree(dev->blocks);
+    dev->blocks = NULL;
+err_blocks:
+    kfree(dev->block_sizes);
+    dev->block_sizes = NULL;
+err_block_sizes:
+    return -ENOMEM;
 }
+
 static void zrd_release(struct inode *inode, struct file *file)
 {
     struct zrd_dev *dev = get_dev(inode);
-    if (dev->ptr != NULL)
-        kfree(dev->ptr);
+    if (dev == NULL)
+        return;
 
     MOD_DEC_USE_COUNT;
 
-    printk("ZRAMDISK: Closed dev %d", dev->nr);
+    printk("ZRAMDISK: Closed dev %d\n", dev->nr);
 }
 
-static int decompress(void *dst, const void *src, int size);
-static int compress(void *dst, const void *src, int size);
+static int zread(struct zrd_dev *dev, void *dst, int sector, int num_sectors);
+static int zwrite(struct zrd_dev *dev, const void *src, int sector,
+                  int num_sectors);
 
 static void zrd_request(void)
 {
     unsigned int minor;
-    int i, offset, len, page, num_pages, compressed_len;
+    int offset, len, sector, num_sectors;
     struct zrd_dev *zrd_dev;
-    void *dev_ptr;
     void *cache_ptr;
 
 repeat:
@@ -250,46 +319,45 @@ repeat:
     minor = DEVICE_NR(CURRENT->rq_dev);
 
     if (minor >= zrd_num_devices) {
-        printk("ZRAMDISK: dev %d invalid", minor);
+        printk("ZRAMDISK: dev %d invalid\n", minor);
         end_request(0);
         goto repeat;
     }
 
     zrd_dev = zrd_devs + minor;
 
-    if (zrd_dev->ptr == NULL) {
-        printk("ZRAMDISK: dev %d not opened", minor);
+    if (zrd_dev->block_sizes == NULL) {
+        printk("ZRAMDISK: dev %d not opened\n", minor);
         end_request(0);
         goto repeat;
     }
 
-    page      = CURRENT->sector;
-    num_pages = CURRENT->current_nr_sectors;
-    offset    = page * PAGE_SIZE;
-    len       = num_pages * PAGE_SIZE;
-    dev_ptr   = (char *)(zrd_dev->ptr) + page * PAGE_SIZE;
-    cache_ptr = CURRENT->buffer;
+    sector      = CURRENT->sector;
+    num_sectors = CURRENT->current_nr_sectors;
+    offset      = sector * ZRD_HARDSECT_SIZE;
+    len         = num_sectors * ZRD_HARDSECT_SIZE;
+    cache_ptr   = CURRENT->buffer;
 
     if ((offset + len) > zrd_dev->size) {
-        printk("ZRAMDISK: dev %d overrun by %d bytes", zrd_dev->nr, (offset + len) - zrd_dev->size);
+        printk("ZRAMDISK: dev %d overrun by %d bytes\n", zrd_dev->nr,
+               (offset + len) - zrd_dev->size);
         end_request(0);
         goto repeat;
     }
 
     if (CURRENT->cmd == READ) {
-        for (i = 0; i < num_pages; ++i)
-            if (decompress((char *)(cache_ptr) + i * PAGE_SIZE, (char *)(dev_ptr) + i * PAGE_SIZE,
-                           PAGE_SIZE) != PAGE_SIZE) {
-                printk("ZRAMDISK: oh, page decompressed is less than page size?!");
-                end_request(0);
-                goto repeat;
-            }
+        zread(zrd_dev, cache_ptr, sector, num_sectors);
+        if (zrd_verbose_log)
+            printk("ZRAMDISK: read [%d,%d) sectors\n", sector,
+                   sector + num_sectors);
     } else if (CURRENT->cmd == WRITE) {
-        for (i = 0; i < num_pages; ++i)
-            zrd_dev->pages[page + i] = compress((char *)(dev_ptr) + i * PAGE_SIZE,
-                                                (char *)(cache_ptr) + i * PAGE_SIZE, PAGE_SIZE);
+        zwrite(zrd_dev, cache_ptr, sector, num_sectors);
+        if (zrd_verbose_log)
+            printk("ZRAMDISK: wrote [%d,%d) sectors\n", sector,
+                   sector + num_sectors);
     } else {
-        printk("ZRAMDISK: dev %d received unknown cmd %d", zrd_dev->nr, CURRENT->cmd);
+        printk("ZRAMDISK: dev %d received unknown cmd %d\n", zrd_dev->nr,
+               CURRENT->cmd);
         end_request(0);
         goto repeat;
     }
@@ -299,13 +367,116 @@ repeat:
     goto repeat;
 }
 
+static int decompress(void *dst, const void *src, int size);
+static int compress(void *dst, const void *src, int size);
+
+static int zread(struct zrd_dev *dev, void *dst, int sector, int num_sectors)
+{
+    int block, block_start_sector, block_end_sector, i, size;
+    void *blk_ptr;
+
+    for (i = sector; i < sector + num_sectors;) {
+        block              = (i * ZRD_HARDSECT_SIZE) / ZRD_BLKSIZE_SIZE;
+        block_start_sector = i % ZRD_SECTORS_IN_BLK;
+        block_end_sector   = MIN(ZRD_SECTORS_IN_BLK,
+                                 block_start_sector + sector + num_sectors - i);
+        blk_ptr            = dev->blocks[block];
+
+        if (block_start_sector == 0 && block_end_sector == ZRD_SECTORS_IN_BLK) {
+            if (decompress((char *)(dst) + (i - sector) * ZRD_HARDSECT_SIZE,
+                           blk_ptr, ZRD_BLKSIZE_SIZE) != ZRD_BLKSIZE_SIZE) {
+                printk("ZRAMDISK: oh, block decompressed is less than block "
+                       "size?!\n");
+                return 0;
+            }
+            i += ZRD_SECTORS_IN_BLK;
+            continue;
+        }
+
+        if (decompress(dev->scratch_blk, blk_ptr, ZRD_BLKSIZE_SIZE) !=
+            ZRD_BLKSIZE_SIZE) {
+            printk("ZRAMDISK: oh, block decompressed is less than block "
+                   "size?!\n");
+            return 0;
+        }
+
+        size = (block_end_sector - block_start_sector);
+        memcpy((char *)(dst) + (i - sector) * ZRD_HARDSECT_SIZE,
+               (char *)(dev->scratch_blk) +
+                   block_start_sector * ZRD_HARDSECT_SIZE,
+               size);
+
+        i += size;
+
+        if (zrd_verbose_log)
+            printk("ZRAMDISK: decompressed sectors [%d,%d) within block %d\n",
+                   block_start_sector, block_end_sector, block);
+    }
+
+    return num_sectors * ZRD_HARDSECT_SIZE;
+}
+
+static int zwrite(struct zrd_dev *dev, const void *src, int sector,
+                  int num_sectors)
+{
+    int block, block_start_sector, block_end_sector, i, size;
+    void *blk_ptr;
+
+    for (i = sector; i < sector + num_sectors;) {
+        block              = (i * ZRD_HARDSECT_SIZE) / ZRD_BLKSIZE_SIZE;
+        block_start_sector = i % ZRD_SECTORS_IN_BLK;
+        block_end_sector   = MIN(ZRD_SECTORS_IN_BLK,
+                                 block_start_sector + sector + num_sectors - i);
+        blk_ptr            = dev->blocks[block];
+
+        if (block_start_sector == 0 && block_end_sector == ZRD_SECTORS_IN_BLK) {
+            if (compress(blk_ptr,
+                         (const char *)(src) + (i - sector) * ZRD_HARDSECT_SIZE,
+                         ZRD_BLKSIZE_SIZE) != ZRD_BLKSIZE_SIZE) {
+                printk("ZRAMDISK: oh, block decompressed is less than block "
+                       "size?!\n");
+                return 0;
+            }
+            i += ZRD_SECTORS_IN_BLK;
+            continue;
+        }
+
+        if (decompress(dev->scratch_blk, blk_ptr, ZRD_BLKSIZE_SIZE) !=
+            ZRD_BLKSIZE_SIZE) {
+            printk("ZRAMDISK: oh, block decompressed is less than block "
+                   "size?!\n");
+            return 0;
+        }
+
+        size = (block_end_sector - block_start_sector);
+        memcpy((char *)(dev->scratch_blk) +
+                   block_start_sector * ZRD_HARDSECT_SIZE,
+               (const char *)(src) + (i - sector) * ZRD_HARDSECT_SIZE, size);
+
+        if (compress(dev->scratch_blk, blk_ptr, ZRD_BLKSIZE_SIZE) !=
+            ZRD_BLKSIZE_SIZE) {
+            printk("ZRAMDISK: oh, block decompressed is less than block "
+                   "size?!\n");
+            return 0;
+        }
+
+        if (zrd_verbose_log)
+            printk("ZRAMDISK: compressed sectors [%d,%d) within block %d\n",
+                   block_start_sector, block_end_sector, block);
+
+        i += size;
+    }
+
+    return num_sectors * ZRD_HARDSECT_SIZE;
+}
+
 static int decompress(void *dst, const void *src, int size)
 {
-	memcpy(dst, src, size);
-	return size;
+    memcpy(dst, src, size);
+    return size;
 }
 static int compress(void *dst, const void *src, int size)
 {
-	memcpy(dst, src, size);
-	return size;
+    memcpy(dst, src, size);
+    return size;
 }
