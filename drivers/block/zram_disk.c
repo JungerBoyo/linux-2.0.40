@@ -470,9 +470,56 @@ static int zwrite(struct zrd_dev *dev, const void *src, int sector,
     return num_sectors * ZRD_HARDSECT_SIZE;
 }
 
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef unsigned int u32;
+typedef int i32;
+
+struct lz4_token {
+    u8 match_len : 4;
+    u8 literal_len : 4;
+};
+
 static int decompress(void *dst, const void *src, int size)
 {
-    memcpy(dst, src, size);
+    i32 i, literal_len, match_len, match_offset;
+    u16 compressed_len = *(const u16 *)(src);
+    const u8 *src_u8   = (const u8 *)(src);
+    u8 *dst_u8         = (u8 *)(dst);
+
+    for (i = sizeof(compressed_len); i < compressed_len;) {
+        struct lz4_token token = *(const struct lz4_token *)(src_u8 + i);
+        i += sizeof(token);
+
+        if (token.literal_len > 0) {
+            literal_len = (i32)(token.literal_len);
+            if (literal_len == 0x0F) {
+                for (; src_u8[i] == 0xFF; ++i)
+                    literal_len += (i32)(src_u8[i]);
+
+                literal_len += (i32)(src_u8[i]);
+            }
+
+            memcpy(dst_u8, src_u8 + i, literal_len);
+            dst_u8 += literal_len;
+        }
+
+        match_offset = (i32)(*(const u16 *)(src_u8 + i));
+        i += sizeof(u16);
+
+        match_len = (i32)(token.match_len);
+        if (match_len == 0x0F) {
+            for (; src_u8[i] == 0xFF; ++i)
+                match_len += (i32)(src_u8[i]);
+
+            match_len += (i32)(src_u8[i]);
+        }
+        match_len += 4;
+
+        memcpy(dst_u8, dst_u8 - match_offset, match_len);
+        dst_u8 += match_len;
+    }
+
     return size;
 }
 static int compress(void *dst, const void *src, int size)
