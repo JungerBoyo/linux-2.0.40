@@ -25,6 +25,7 @@ int zrd_verbose_log = 0;
 
 #define ZRD_SECTORS_IN_BLK (ZRD_BLKSIZE_SIZE / ZRD_HARDSECT_SIZE)
 #define ZRD_INITIAL_BLKSIZE_SIZE 4096
+#define ZRD_HASH_TABLE_SIZE 12
 
 #define ZRD_IO_COMPRESSION_RATE_GET _IOR(MAJOR_NR, 0, long)
 
@@ -34,6 +35,7 @@ struct zrd_dev {
     unsigned short *block_sizes;
     int size;
     void *scratch_blk;
+    unsigned short *hash_table;
 };
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -151,6 +153,9 @@ void cleanup_module(void)
 
         if (zrd_devs[i].scratch_blk != NULL)
             kfree(zrd_devs[i].scratch_blk);
+
+        if (zrd_devs[i].hash_table != NULL)
+            kfree(zrd_devs[i].hash_table);
     }
 
     kfree(zrd_mem);
@@ -271,13 +276,25 @@ static int zrd_open(struct inode *inode, struct file *file)
                    dev->nr);
             goto err_scratch;
         }
+
+        dev->hash_table = kmalloc(
+            (1 << ZRD_HASH_TABLE_SIZE) * sizeof(*dev->hash_table), GFP_KERNEL);
+        if (dev->hash_table == NULL) {
+            printk("ZRAMDISK: Failed to allocate hash table for dev %d\n",
+                   dev->nr);
+            goto err_hash_table;
+        }
+        memset(dev->hash_table, 0xFF,
+               (1 << ZRD_HASH_TABLE_SIZE) * sizeof(*dev->hash_table));
     }
 
     MOD_INC_USE_COUNT;
 
     printk("ZRAMDISK: Opened dev %d\n", dev->nr);
     return 0;
-
+err_hash_table:
+    kfree(dev->hash_table);
+    dev->hash_table = NULL;
 err_scratch:
 err_block:
     for (j = 0; j < i; ++j)
@@ -368,7 +385,8 @@ repeat:
 }
 
 static int decompress(void *dst, const void *src, int size);
-static int compress(void *dst, const void *src, int size);
+static int compress(unsigned short *hash_table, void *dst, const void *src,
+                    int dst_size, int src_size);
 
 static int zread(struct zrd_dev *dev, void *dst, int sector, int num_sectors)
 {
@@ -430,11 +448,10 @@ static int zwrite(struct zrd_dev *dev, const void *src, int sector,
         blk_ptr            = dev->blocks[block];
 
         if (block_start_sector == 0 && block_end_sector == ZRD_SECTORS_IN_BLK) {
-            if (compress(blk_ptr,
+            if (compress(dev->hash_table, blk_ptr,
                          (const char *)(src) + (i - sector) * ZRD_HARDSECT_SIZE,
-                         ZRD_BLKSIZE_SIZE) != ZRD_BLKSIZE_SIZE) {
-                printk("ZRAMDISK: oh, block decompressed is less than block "
-                       "size?!\n");
+                         ZRD_BLKSIZE_SIZE, dev->block_sizes[block]) == 0) {
+            	printk("TODO grow block if == 0 \n");
                 return 0;
             }
             i += ZRD_SECTORS_IN_BLK;
@@ -453,10 +470,9 @@ static int zwrite(struct zrd_dev *dev, const void *src, int sector,
                    block_start_sector * ZRD_HARDSECT_SIZE,
                (const char *)(src) + (i - sector) * ZRD_HARDSECT_SIZE, size);
 
-        if (compress(dev->scratch_blk, blk_ptr, ZRD_BLKSIZE_SIZE) !=
-            ZRD_BLKSIZE_SIZE) {
-            printk("ZRAMDISK: oh, block decompressed is less than block "
-                   "size?!\n");
+        if (compress(dev->hash_table, dev->scratch_blk, blk_ptr,
+                     ZRD_BLKSIZE_SIZE, dev->block_sizes[block]) == 0) {
+            printk("TODO grow block if == 0 \n");
             return 0;
         }
 
@@ -480,6 +496,13 @@ struct lz4_token {
     u8 literal_len : 4;
 };
 
+static void lz4_match_copy(u8 *dst, const u8 *src, int size)
+{
+    int i;
+    for (i = 0; i < size; ++i)
+        dst[i] = src[i];
+}
+
 static int decompress(void *dst, const void *src, int size)
 {
     i32 i, literal_len, match_len, match_offset;
@@ -502,7 +525,11 @@ static int decompress(void *dst, const void *src, int size)
 
             memcpy(dst_u8, src_u8 + i, literal_len);
             dst_u8 += literal_len;
+            i += literal_len;
         }
+
+        if (i == compressed_len)
+            break; // last block, no match part present
 
         match_offset = (i32)(*(const u16 *)(src_u8 + i));
         i += sizeof(u16);
@@ -516,14 +543,112 @@ static int decompress(void *dst, const void *src, int size)
         }
         match_len += 4;
 
-        memcpy(dst_u8, dst_u8 - match_offset, match_len);
+        // match might overlap and depend on previously written byte!
+        lz4_match_copy(dst_u8, dst_u8 - match_offset, match_len);
         dst_u8 += match_len;
     }
 
     return size;
 }
-static int compress(void *dst, const void *src, int size)
+
+static u32 hash(const u8 *value)
 {
-    memcpy(dst, src, size);
-    return size;
+    u32 val = ((u32)(value[0])) | ((u32)(value[1]) << 8) |
+              ((u32)(value[2]) << 16) | ((u32)(value[3]) << 24);
+    return (value * 2654435761U) >> (32 - ZRD_HASH_TABLE_SIZE);
+}
+
+static int compress(unsigned short *hash_table, void *dst, const void *src,
+                    int dst_size, int src_size)
+{
+    // TODO: add bounds checking for compressed block max size and early exits
+    int i, literal_start, match_pos, literal_len, match_len;
+    u32 hash_val;
+    u16 match_index, match_offset, size;
+    u8 *src_u8 = (u8 *)(src);
+    u8 *dst_u8 = (u8 *)(dst) + 2; // first 2 bytes is dst_size
+    for (i = 0, literal_start = 0; i < dst_size;) {
+        hash_val    = hash(src_u8 + i);
+        match_index = hash_table[hash_val];
+        if (match_index == 0xFFFF) {
+            hash_table[hash_val] = i++;
+            continue;
+        }
+
+        match_pos = i;
+        while (match_pos < dst_size &&
+               src_u8[match_index++] == src_u8[match_pos++]) {
+        }
+
+        if (match_pos - i < 4)
+            continue; // ouch.. overwritten by some other sequence
+
+        struct lz4_token token = {0};
+
+        literal_len = i - literal_start;
+        if (literal_len >= 0x0F) {
+            token.literal_len = 0x0F;
+            literal_len -= 0x0F;
+
+            while (literal_len >= 0xFF) {
+                *(dst_u8++) = 0xFF;
+                literal_len -= 0xFF;
+            }
+
+            *(dst_u8++) = literal_len;
+        } else {
+            token.literal_len = literal_len;
+        }
+
+        literal_len = i - literal_start;
+		memcpy(dst_u8, src_u8 + literal_start, literal_len);
+		dst_u8 += literal_len;
+
+		match_offset = i - match_index;
+        *(dst_u8++) = match_offset & 0xFF;
+        *(dst_u8++) = match_offset >> 8;
+
+        match_len = (match_pos - i) - 4;
+        if (match_len >= 0x0F) {
+            token.match_len = 0x0F;
+            match_len -= 0x0F;
+
+            while (match_len >= 0xFF) {
+                *(dst_u8++) = 0xFF;
+                match_len -= 0xFF;
+            }
+
+            *(dst_u8++) = match_len;
+        } else {
+            token.match_len = literal_len;
+        }
+    }
+
+	literal_len = i - literal_start;
+	if (literal_len >= 0x0F) {
+		token.literal_len = 0x0F;
+		literal_len -= 0x0F;
+
+		while (literal_len >= 0xFF) {
+			*(dst_u8++) = 0xFF;
+			literal_len -= 0xFF;
+		}
+
+		*(dst_u8++) = literal_len;
+	} else {
+		token.literal_len = literal_len;
+	}
+
+	literal_len = i - literal_start;
+	memcpy(dst_u8, src_u8 + literal_start, literal_len);
+	dst_u8 += literal_len;
+
+	size = dst_u8 - (u8*)(dst) - 2;
+	dst_u8 = (u8*)(dst);
+    *(dst_u8++) = size & 0xFF;
+    *(dst_u8++) = size >> 8;
+
+    memset(hash_table, 0xFF, (1 << ZRD_HASH_TABLE_SIZE) * dst_sizeof(u16));
+
+    return dst_size;
 }
