@@ -25,7 +25,7 @@ int zrd_hash_table_size_log = 12;
 #define ZRD_HARDSECT_SIZE 512
 
 #define ZRD_SECTORS_IN_BLK (ZRD_BLKSIZE_SIZE / ZRD_HARDSECT_SIZE)
-#define ZRD_INITIAL_BLKSIZE_SIZE (4096+128)
+#define ZRD_INITIAL_BLKSIZE_SIZE 256
 #define ZRD_SCRATCH_BLKSIZE_SIZE ZRD_BLKSIZE_SIZE
 
 #define ZRD_IO_COMPRESSION_RATE_GET 0x01
@@ -146,6 +146,9 @@ void cleanup_module(void)
     for (i = 0; i < zrd_num_devices; ++i) {
         if (zrd_devs[i].block_sizes != NULL)
             kfree(zrd_devs[i].block_sizes);
+
+        if (zrd_devs[i].block_compressed_sizes != NULL)
+            kfree(zrd_devs[i].block_compressed_sizes);
 
         if (zrd_devs[i].blocks != NULL) {
             for (j = 0; j < zrd_blk_size; ++j)
@@ -269,7 +272,6 @@ static int zrd_open(struct inode *inode, struct file *file)
         for (i = 0; i < zrd_blk_size; ++i) {
             dev->block_sizes[i] = ZRD_INITIAL_BLKSIZE_SIZE;
             dev->blocks[i]      = kmalloc(ZRD_INITIAL_BLKSIZE_SIZE, GFP_KERNEL);
-	    printk("ZRAMDISK: block %d ptr = %p\n", i, dev->blocks[i]);
             if (dev->blocks[i] == NULL) {
                 printk("ZRAMDISK: Failed to allocate zramdisk %d block %d\n",
                        dev->nr, i);
@@ -472,13 +474,15 @@ static int extend_block(struct zrd_dev *dev, int block, const void *src)
         memcpy(dev->blocks[block], src, ZRD_BLKSIZE_SIZE);
         return 0;
     }
-
-    printk("ZRAMDISK: Freeing block %d ptr = %p\n", block, dev->blocks[block]);
+    if (zrd_verbose_log)
+        printk("ZRAMDISK: Freeing block %d ptr = %p\n", block,
+               dev->blocks[block]);
     kfree(dev->blocks[block]);
 
-    new_block_size     = block_compressed_size >= ZRD_BLKSIZE_SIZE
-                             ? ZRD_BLKSIZE_SIZE
-                             : (int)(ceilpow2((u32)(block_compressed_size)));
+    new_block_size = block_compressed_size >= ZRD_BLKSIZE_SIZE
+                         ? ZRD_BLKSIZE_SIZE
+                         : (int)(ceilpow2((u32)(block_compressed_size)));
+
     dev->blocks[block] = kmalloc(new_block_size, GFP_KERNEL);
     if (dev->blocks[block] == NULL) {
         printk("ZRAMDISK: Failed to allocate zramdisk %d block %d\n", dev->nr,
@@ -500,8 +504,7 @@ static int extend_block(struct zrd_dev *dev, int block, const void *src)
 static int zwrite(struct zrd_dev *dev, const void *src, int sector,
                   int num_sectors)
 {
-    int block, block_start_sector, block_end_sector, i, size,
-        ret;
+    int block, block_start_sector, block_end_sector, i, size, ret;
     void *blk_ptr;
 
     for (i = sector; i < sector + num_sectors;) {
@@ -522,6 +525,7 @@ static int zwrite(struct zrd_dev *dev, const void *src, int sector,
                                    (const char *)(src) +
                                        (i - sector) * ZRD_HARDSECT_SIZE);
                 if (ret == 1) {
+                    blk_ptr = dev->blocks[block];
                     goto again0;
                 } else if (ret < 0) {
                     return ret;
@@ -551,6 +555,7 @@ static int zwrite(struct zrd_dev *dev, const void *src, int sector,
         if (dev->block_compressed_sizes[block] > dev->block_sizes[block]) {
             ret = extend_block(dev, block, dev->scratch_blk);
             if (ret == 1) {
+                blk_ptr = dev->blocks[block];
                 goto again1;
             } else if (ret < 0) {
                 return ret;
